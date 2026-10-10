@@ -17,6 +17,8 @@ build/
 build-*/
 sdkconfig
 sdkconfig.old
+sdkconfig.token.local
+components/muse/gemini_local.h
 managed_components/
 dependencies.lock
 .cache/

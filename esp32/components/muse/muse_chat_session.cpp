@@ -26,8 +26,8 @@
  *   2. POST /chat/stream with the transcript. The reply arrives as events on
  *      the connection's long-lived POST /chat/subscribe stream: one or more
  *      assistant messages, each delta.message_start / text_append / message_done.
- *   3. Each finished message is shown at reading pace (see start_tts to
- *      speak it with a TTS API of your own; Muse doesn't speak gadget replies).
+ *   3. Each finished message is spoken with Gemini TTS when gemini_local.h
+ *      is present, otherwise shown at reading pace (see start_tts).
  * A turn has no explicit end event; like Sidekick, it settles once every
  * message is done and nothing has arrived for a few seconds.
  *
@@ -52,10 +52,12 @@
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_tls.h"
+#include "mbedtls/base64.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
@@ -72,6 +74,10 @@ extern "C" {
 #include "muse_wifi.h"
 }
 #include "muse_chat_priv.h"
+
+#if __has_include("gemini_local.h")
+#include "gemini_local.h"
+#endif
 
 #include <xplat/noise/core/ClientSession.h>
 #include <xplat/noise/core/PsaCryptoBackend.h>
@@ -262,6 +268,9 @@ static void log_marks(void);
 static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
 static int16_t *s_pcm16;     /* resampled output */
 static int64_t s_last_seq;
+/* Gemini TTS runs beside this task. 0 means the in-flight clip was cancelled. */
+static std::atomic<uint32_t> s_speak_gen{0};
+static std::atomic<bool> s_speak_busy{false};
 
 static int64_t now_us(void)
 {
@@ -953,6 +962,7 @@ static void turn_reset_streams(void)
 
 static void turn_finish(void)
 {
+    s_speak_gen.store(0);
     turn_reset_streams();
     s_turn.phase = P_IDLE;
     s_turn.dict_id = s_turn.chat_id = 0;
@@ -1501,6 +1511,356 @@ static void on_chat_ack(stream_t *s)
 
 /* ---- Turn: speech ---- */
 
+#if defined(MUSE_GEMINI_TTS)
+
+struct speak_job_t {
+    uint32_t gen;
+    int msg;
+    char *text;
+};
+
+static bool speak_current(uint32_t gen)
+{
+    return gen != 0 && s_speak_gen.load() == gen && s_turn.gen == gen && s_turn.phase != P_IDLE;
+}
+
+/* Blocks while the 2 s reply buffer is full so a long clip is not dropped. */
+static bool speak_send(uint32_t gen, const int16_t *pcm, size_t n)
+{
+    while (n && speak_current(gen)) {
+        size_t room = xStreamBufferSpacesAvailable(s_out) / sizeof(int16_t);
+        if (!room) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        size_t chunk = n < room ? n : room;
+        if (xStreamBufferSend(s_out, pcm, chunk * sizeof(int16_t), 0) != chunk * sizeof(int16_t)) {
+            return false;
+        }
+        s_turn.pcm_out += chunk;
+        pcm += chunk;
+        n -= chunk;
+    }
+    return speak_current(gen);
+}
+
+struct wav_pull_t {
+    bool ready;
+    int rate;
+    int channels;
+    uint8_t hdr[44];
+    int hdr_n;
+    uint8_t hold[8];
+    int hold_n;
+};
+
+static uint16_t rd_u16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t rd_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Pulls mono s16 from a 24 kHz WAV byte stream. Returns false on a bad header. */
+static bool wav_mono(wav_pull_t *w, const uint8_t *in, size_t n, int16_t *out, size_t cap, size_t *got)
+{
+    *got = 0;
+    size_t off = 0;
+    if (!w->ready) {
+        while (off < n && w->hdr_n < 44) {
+            w->hdr[w->hdr_n++] = in[off++];
+        }
+        if (w->hdr_n < 44) {
+            return true;
+        }
+        if (memcmp(w->hdr, "RIFF", 4) != 0 || memcmp(w->hdr + 8, "WAVE", 4) != 0 ||
+            memcmp(w->hdr + 36, "data", 4) != 0) {
+            return false;
+        }
+        if (rd_u16(w->hdr + 20) != 1 || rd_u16(w->hdr + 34) != 16) {
+            return false;
+        }
+        w->channels = rd_u16(w->hdr + 22);
+        w->rate = (int)rd_u32(w->hdr + 24);
+        if ((w->channels != 1 && w->channels != 2) || w->rate < 8000 || w->rate > 48000) {
+            return false;
+        }
+        w->ready = true;
+    }
+    int frame = w->channels * 2;
+    while (off < n && *got < cap) {
+        w->hold[w->hold_n++] = in[off++];
+        if (w->hold_n < frame) {
+            continue;
+        }
+        int32_t sample = (int16_t)rd_u16(w->hold);
+        if (w->channels == 2) {
+            sample = (sample + (int16_t)rd_u16(w->hold + 2)) / 2;
+        }
+        out[(*got)++] = (int16_t)sample;
+        w->hold_n = 0;
+    }
+    if (off < n) {
+        /* Caller feeds small decoded chunks; this only trips if cap is tiny. */
+        return false;
+    }
+    return true;
+}
+
+static void speak_fail(uint32_t gen, int msg)
+{
+    if (!speak_current(gen) || s_turn.tts_msg != msg) {
+        return;
+    }
+    msg_t &m = s_turn.msgs[msg];
+    if (s_turn.pcm_out > m.pcm_start) {
+        m.pcm_frames = s_turn.pcm_out - m.pcm_start;
+        m.tts = TTS_FINISHED;
+        s_turn.tts_msg = -1;
+        return;
+    }
+    m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+    s_turn.silent = true;
+}
+
+static void gemini_task(void *arg)
+{
+    speak_job_t *job = static_cast<speak_job_t *>(arg);
+    uint32_t gen = job->gen;
+    int msg = job->msg;
+    char *text = job->text;
+    delete job;
+
+    bool ok = false;
+    esp_http_client_handle_t client = nullptr;
+    char *body = nullptr;
+    cJSON *root = cJSON_CreateObject();
+    cJSON *contents = cJSON_AddArrayToObject(root, "contents");
+    cJSON *content = cJSON_CreateObject();
+    cJSON *parts = cJSON_AddArrayToObject(content, "parts");
+    cJSON *part = cJSON_CreateObject();
+    cJSON_AddStringToObject(part, "text", text);
+    cJSON_AddItemToArray(parts, part);
+    cJSON_AddItemToArray(contents, content);
+    cJSON *gen_cfg = cJSON_AddObjectToObject(root, "generationConfig");
+    cJSON *mods = cJSON_AddArrayToObject(gen_cfg, "responseModalities");
+    cJSON_AddItemToArray(mods, cJSON_CreateString("AUDIO"));
+    cJSON *speech = cJSON_AddObjectToObject(gen_cfg, "speechConfig");
+    cJSON *voice = cJSON_AddObjectToObject(speech, "voiceConfig");
+    cJSON *prebuilt = cJSON_AddObjectToObject(voice, "prebuiltVoiceConfig");
+    cJSON_AddStringToObject(prebuilt, "voiceName", "Kore");
+    body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    heap_caps_free(text);
+    if (!body) {
+        speak_fail(gen, msg);
+        s_speak_busy.store(false);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    char url[192];
+    int blen = (int)strlen(body);
+    snprintf(url, sizeof(url), "%s/v1beta/models/%s:generateContent", MUSE_GEMINI_URL, MUSE_GEMINI_MODEL);
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.method = HTTP_METHOD_POST;
+    cfg.timeout_ms = 120000;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.buffer_size = 2048;
+    client = esp_http_client_init(&cfg);
+    if (client && esp_http_client_set_header(client, "Content-Type", "application/json") == ESP_OK &&
+        esp_http_client_set_header(client, "x-goog-api-key", MUSE_GEMINI_KEY) == ESP_OK &&
+        esp_http_client_open(client, blen) == ESP_OK &&
+        esp_http_client_write(client, body, blen) == blen &&
+        esp_http_client_fetch_headers(client) >= 0) {
+        int status = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "gemini tts HTTP %d", status);
+        ok = status == 200;
+    } else {
+        ESP_LOGW(TAG, "gemini tts request failed");
+    }
+    cJSON_free(body);
+    if (!ok || !speak_current(gen)) {
+        if (client) {
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+        }
+        speak_fail(gen, msg);
+        s_speak_busy.store(false);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    /* Google pretty-prints the body, so the key is `"data": "` with a space. */
+    enum { S_KEY, S_COLON, S_QUOTE, S_B64 } st = S_KEY;
+    char keywin[6];
+    int keyn = 0;
+    char b64[4];
+    int b64_n = 0;
+    wav_pull_t wav = {};
+    resampler_t down;
+    bool down_ready = false;
+    size_t body_bytes = 0;
+    int16_t mono[256];
+    int16_t played[384];
+    uint8_t raw[384];
+    char rx[512];
+    while (speak_current(gen)) {
+        int n = esp_http_client_read(client, rx, sizeof(rx));
+        if (n < 0) {
+            ok = false;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        body_bytes += n;
+        bool ended = false;
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)rx[i];
+            if (st != S_B64) {
+                if (st == S_COLON || st == S_QUOTE) {
+                    if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+                        continue;
+                    }
+                    if (st == S_COLON && c == ':') {
+                        st = S_QUOTE;
+                        continue;
+                    }
+                    if (st == S_QUOTE && c == '"') {
+                        st = S_B64;
+                        continue;
+                    }
+                    st = S_KEY;
+                    keyn = 0;
+                }
+                if (keyn < 6) {
+                    keywin[keyn++] = (char)c;
+                } else {
+                    memmove(keywin, keywin + 1, 5);
+                    keywin[5] = (char)c;
+                }
+                if (keyn == 6 && memcmp(keywin, "\"data\"", 6) == 0) {
+                    st = S_COLON;
+                }
+                continue;
+            }
+            if (c == '"') {
+                ended = true;
+                break;
+            }
+            if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+                continue;
+            }
+            b64[b64_n++] = c;
+            if (b64_n < 4) {
+                continue;
+            }
+            size_t olen = 0;
+            if (mbedtls_base64_decode(raw, sizeof(raw), &olen, reinterpret_cast<const unsigned char *>(b64), 4) != 0) {
+                ok = false;
+                ended = true;
+                break;
+            }
+            b64_n = 0;
+            size_t samples = 0;
+            if (!wav_mono(&wav, raw, olen, mono, 256, &samples)) {
+                ok = false;
+                ended = true;
+                break;
+            }
+            if (!samples) {
+                continue;
+            }
+            if (!down_ready) {
+                ESP_LOGI(TAG, "gemini tts wav %d Hz, %d ch", wav.rate, wav.channels);
+                resampler_init(&down, wav.rate, MIC_RATE);
+                down_ready = true;
+                mark(M_AUDIO);
+            }
+            size_t out_n = resample(&down, mono, samples, played);
+            if (out_n && !speak_send(gen, played, out_n)) {
+                ok = false;
+                ended = true;
+                break;
+            }
+        }
+        if (ended) {
+            break;
+        }
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (speak_current(gen) && s_turn.tts_msg == msg) {
+        msg_t &m = s_turn.msgs[msg];
+        if (ok && down_ready && s_turn.pcm_out > m.pcm_start) {
+            m.pcm_frames = s_turn.pcm_out - m.pcm_start;
+            m.tts = TTS_FINISHED;
+            s_turn.tts_msg = -1;
+            ESP_LOGI(TAG, "gemini tts played %u frames", (unsigned)m.pcm_frames);
+        } else {
+            if (!down_ready) {
+                ESP_LOGW(TAG, "gemini tts: no audio in %u bytes", (unsigned)body_bytes);
+            }
+            speak_fail(gen, msg);
+        }
+    }
+    s_speak_busy.store(false);
+    vTaskDelete(nullptr);
+}
+
+/* True when this message is being spoken, or a previous clip is still winding down. */
+static bool gemini_speak(int i)
+{
+    if (s_speak_busy.load() || !s_turn.texts) {
+        return s_speak_busy.load();
+    }
+    msg_t &m = s_turn.msgs[i];
+    char *text = static_cast<char *>(psram_alloc(TEXT_MAX));
+    speak_job_t *job = new (std::nothrow) speak_job_t;
+    if (!text || !job) {
+        heap_caps_free(text);
+        delete job;
+        return false;
+    }
+    strlcpy(text, s_turn.texts + i * TEXT_MAX, TEXT_MAX);
+    if (!text[0]) {
+        heap_caps_free(text);
+        delete job;
+        return false;
+    }
+    m.pcm_start = s_turn.pcm_out;
+    m.pcm_frames = 0;
+    m.tts = TTS_ACTIVE;
+    s_turn.tts_msg = i;
+    s_turn.silent = false;
+    s_speak_gen.store(s_turn.gen);
+    job->gen = s_turn.gen;
+    job->msg = i;
+    job->text = text;
+    s_speak_busy.store(true);
+    if (xTaskCreatePinnedToCore(gemini_task, "gemini_tts", 20 * 1024, job, 4, nullptr, 1) != pdPASS) {
+        s_speak_gen.store(0);
+        s_speak_busy.store(false);
+        s_turn.tts_msg = -1;
+        m.tts = TTS_QUEUED;
+        heap_caps_free(text);
+        delete job;
+        return false;
+    }
+    ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
+    show_reply_start(m);
+    mark(M_TTS);
+    return true;
+}
+
+#endif /* MUSE_GEMINI_TTS */
+
 static void start_tts(void)
 {
     if (s_turn.tts_msg >= 0) {
@@ -1511,20 +1871,13 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
+#if defined(MUSE_GEMINI_TTS)
+        if (gemini_speak(i)) {
+            return;
+        }
+#endif
         /*
-         * Replies are text, shown at reading pace: silence in place of speech
-         * paces the captions and ends the turn. To speak them instead, send
-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
-         * play the MP3 it returns. In place of the silence below: keep
-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
-         * end. decode() plays it at the speaker's volume, captions following,
-         * and finishes the message once it's drained.
+         * No TTS clip: silence paces the captions and ends the turn.
          */
         m.pcm_start = s_turn.pcm_out;
         m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
@@ -1587,6 +1940,12 @@ static void decode(void)
     if (s_turn.tts_msg < 0) {
         return;
     }
+#if defined(MUSE_GEMINI_TTS)
+    /* The Gemini task owns this message until it finishes or falls back to silence. */
+    if (s_speak_busy.load() && !s_turn.silent) {
+        return;
+    }
+#endif
     if (s_turn.silent) {
         pace_silently();
         return;
@@ -2087,6 +2446,7 @@ extern "C" bool muse_hatch_ready(void)
 
 extern "C" void muse_hatch_turn_begin(void)
 {
+    s_speak_gen.store(0);
     uint32_t gen = ++s_gen;
     xStreamBufferReset(s_in);
     drain_out();

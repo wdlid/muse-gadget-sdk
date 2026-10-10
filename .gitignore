@@ -24,3 +24,6 @@ muse-simulator.ppm
 # Local gadget provisioning and original-device flash backups.
 .sdk-token
 /backups/
+
+# API keys. The firmware reads a generated header, not this file.
+.env
